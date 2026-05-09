@@ -91,7 +91,7 @@ def load_cached_stock_data(ticker: str):
         balance_sheet = balance_sheet.groupby(balance_sheet.index).last()
 
         #  resample other statement to yearly data
-        income_statement = load_statement(AS_baseurl, "income-statement").resample('YE').sum()
+        income_statement = load_statement(AS_baseurl, "income-statement").resample('YE').last()
         cash_flow_statement = load_statement(AS_baseurl, "cash-flow-statement").resample('YE').last()
 
         #  combine all statement to get market cap on every statement (will duplicate data to fill)
@@ -128,15 +128,21 @@ def load_cached_stock_data(ticker: str):
 #  convert yahoo finance tickers to alphaspread compatible base URL
 def build_AS_url(ticker):
     parts = ticker.split(".")
-    exchange = parts[1]
+    exchange = ""
+    if len(parts) > 1:
+        exchange = parts[1]
     as_company_id = parts[0]
     as_country_code = ""
     
-    if exchange in ["KS", "KQ"]:
-        as_country_code = "krx"
-    elif exchange == "T":
-        as_country_code = "tse"
-    #  TODO: build compat for other exchanges
+    exchange_map = {
+        "KS": "krx",
+        "KQ": "krx",
+        "T": "tse",
+        "L": "lse",
+        "TO": "tsx",
+        "": "nasdaq"
+    }
+    as_country_code = exchange_map[exchange]
 
     if as_country_code == "":
         raise Exception(f"Failed to create alphaspread url for exchange {exchange}")
@@ -183,12 +189,19 @@ def valuation_reporting(fin_data):
             0.5 * fin_data.get('Inventory') - 
             fin_data.get('Total Liabilities')
         )
+    #  Net Cash
+    NC = (
+            fin_data.get('Cash & Cash Equivalents') + 
+            fin_data.get('Short-Term Investments') -
+            fin_data.get('Total Liabilities')
+        )
 
     market_cap = fin_data.get('MarketCap')
     share_count = fin_data.get('Common Shares Outstanding')
     NCAV_per_share = NCAV / share_count
     NNWC_per_share = NNWC / share_count
     VANT_per_share = VANT / share_count
+    NC_per_share = NC / share_count
 
     #  render current valuation results
     last_row = fin_data.raw_data.iloc[-1]
@@ -199,25 +212,25 @@ def valuation_reporting(fin_data):
 
     #  Render graphs for asset valuation
     fig, ax1 = plt.subplots(figsize=(14, 8))
-    yr_index = fin_data.raw_data.index[:-1]
+    yr_index = fin_data.raw_data.index
 
-    #  workaround to avoid representing balance sheet values for current year
-    current_price_graph = pd.Series(current_price, index=yr_index)
-
-    ax1.plot(yr_index, fin_data.get('Close').iloc[:-1], label=f"Prix ({currency})", color='blue', linewidth=2)
-    ax1.plot(yr_index, NCAV_per_share.iloc[:-1], label='Net Current Asset Value', color='orange', linestyle='--')
-    ax1.plot(yr_index, NNWC_per_share.iloc[:-1], label='Net-Net Working Capital', color='red', linestyle=':')
-    ax1.plot(yr_index, VANT_per_share.iloc[:-1], label='Net Tangible Asset Value', color='green', linestyle=':')
-    ax1.plot(yr_index, current_price_graph, label='Current price', color='blue', linestyle='--', linewidth=0.5)
+    ax1.plot(yr_index, fin_data.get('Close'), label=f"Prix ({currency})", color='blue', linewidth=2)
+    ax1.plot(yr_index, NCAV_per_share, label='Net Current Asset Value', color='orange', linestyle='--')
+    ax1.plot(yr_index, NNWC_per_share, label='Net-Net Working Capital', color='green', linestyle=':')
+    ax1.plot(yr_index, NC_per_share, label='Net Cash', color='blue', linestyle='--')
+    ax1.plot(yr_index, VANT_per_share, label='Net Tangible Asset Value', color='red', linestyle='--')
+    ax1.plot(yr_index, pd.Series(current_price, index=yr_index), label='Current price', color="blue", linestyle='--', linewidth=0.8)
 
     current_VANT_per_share = int(VANT_per_share.iloc[-1])
     current_NCAV_per_share = int(NCAV_per_share.iloc[-1])
     current_NNWC_per_share = int(NNWC_per_share.iloc[-1])
+    current_NC_per_share = int(NC_per_share.iloc[-1])
 
     valuation_details = f"Cours actuel: {current_price} {currency}\n"
     valuation_details += f" - P/VANT: {round((current_price/current_VANT_per_share), 2)} (VANT= {current_VANT_per_share} {currency})\n"
     valuation_details += f" - P/NCAV: {round((current_price/current_NCAV_per_share), 2)} (NCAV= {current_NCAV_per_share} {currency})\n"
     valuation_details += f" - P/NNWC: {round((current_price/current_NNWC_per_share), 2)} (NNWC= {current_NNWC_per_share} {currency})\n"
+    valuation_details += f" - P/NC: {round((current_price/current_NC_per_share), 2)} (NC= {current_NC_per_share} {currency})\n"
     valuation_details += f" - Dividend yield: {header.get('dividendYield', 'unknown')}% (payout ratio: {int(header.get('payoutRatio', 0)* 100)} %)\n"
     valuation_details += f" - Float: {floating_share_ratio}%"
     
@@ -236,7 +249,8 @@ def valuation_reporting(fin_data):
 
     ax2 = ax1.twinx()
     colors = ['g' if x > 0 else 'r' for x in fcf_yield]
-    ax2.bar(fcf_yield.index[:-1], fcf_yield.iloc[:-1], width=120, color=colors, alpha=0.3, label='FCF Yield %', zorder=1)
+    yr_index = fcf_yield.index - pd.DateOffset(months=6)  #  do not render bars on next year
+    ax2.bar(yr_index, fcf_yield, width=120, color=colors, alpha=0.3, label='FCF Yield %', zorder=1, align='center')
     ax2.set_ylabel("FCF Yield (%)", color='gray', fontweight='bold')
     
     plt.title(f"{company_name} - {ticker}")
@@ -244,7 +258,6 @@ def valuation_reporting(fin_data):
     plt.grid(True, alpha=0.3)
     plt.show()
 
-
 if __name__ == "__main__":
-    ticker = "123700.KS"
+    ticker = "3131.T"
     valuation_reporting(load_cached_stock_data(ticker))
